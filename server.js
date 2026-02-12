@@ -18,7 +18,7 @@ const corsOptions = {
       .map(o => o.trim());
 
     if (
-      /\.sharepoint\.com$/.test(origin) ||
+      origin.includes('.sharepoint.com') ||
       origin.startsWith('http://localhost') ||
       origin.startsWith('http://127.0.0.1') ||
       allowed.includes(origin)
@@ -30,7 +30,7 @@ const corsOptions = {
   },
   credentials: false,
   methods: ['GET', 'OPTIONS'],
-  allowedHeaders: '*'
+  allowedHeaders: ['Content-Type', 'Authorization']
 };
 
 app.use(cors(corsOptions));
