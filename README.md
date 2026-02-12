@@ -35,9 +35,9 @@ The `.env` file already has your credentials. Verify they're correct:
 
 ```env
 SYSAID_BASE_URL=https://parkson.sysaidit.com
-SYSAID_ACCOUNT_ID=parkson
-SYSAID_CLIENT_ID=Cxa0feraR1urG4Hy0J41wBHAPQgyghF6
-SYSAID_CLIENT_SECRET=1QvLObuqUH_kel39LbZ4rGdKR1ZVvcln61ZIkytUVKJRU1IFbjDJJhDqQtloudbY
+SYSAID_ACCOUNT_ID=###
+SYSAID_CLIENT_ID=###
+SYSAID_CLIENT_SECRET=###
 PORT=3000
 ```
 
