@@ -48,6 +48,12 @@ const SYSAID_CONFIG = {
 };
 
 /* =========================
+   SysAid Status Definitions
+========================= */
+const OPEN_STATUS_IDS = [1, 2, 5, 6, 8, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 42, 44];
+const CLOSED_STATUS_IDS = [3, 4, 7, 18, 19, 20, 21, 28, 29, 34, 35, 36, 39, 40, 41, 43, 98976, 98977];
+
+/* =========================
    Token Cache
 ========================= */
 let tokenCache = { token: null, expiresAt: null };
@@ -72,8 +78,7 @@ async function getAccessToken() {
   );
 
   tokenCache.token = response.data.token;
-  tokenCache.expiresAt =
-    Date.now() + (response.data.expiresIn - 300) * 1000;
+  tokenCache.expiresAt = Date.now() + (response.data.expiresIn - 300) * 1000;
 
   return tokenCache.token;
 }
@@ -97,18 +102,48 @@ async function callConnect(endpoint) {
   return response.data;
 }
 
-function filterTicketsByStatus(records, status) {
-  if (!status || status === 'all') return records;
-
+/* =========================
+   Helper: Build Base Filters
+========================= */
+function buildBaseFilters(status) {
+  // Always filter by Service Request type (srType=1)
+  let filters = 'srType=1';
+  
+  // Add status filter
   if (status === 'open') {
-    return records.filter(r => r.status !== 34);
+    filters += `&status=${OPEN_STATUS_IDS.join(',')}`;
+  } else if (status === 'closed') {
+    filters += `&status=${CLOSED_STATUS_IDS.join(',')}`;
   }
+  
+  return filters;
+}
 
-  if (status === 'closed') {
-    return records.filter(r => r.status === 34);
+/* =========================
+   Helper: Get Count Using Filters
+========================= */
+async function getCountByFilter(baseFilters, additionalFilter = '') {
+  const fullFilters = additionalFilter 
+    ? `${baseFilters}&${additionalFilter}` 
+    : baseFilters;
+    
+  // IMPORTANT: Include srType field so we can filter out non-Service Request records
+  const endpoint = `/service-records/search?limit=100&${fullFilters}&fields=srType`;
+  
+  try {
+    const response = await callConnect(endpoint);
+    
+    // Filter out any records that are not srType=1 (Service Requests)
+    // This is needed because the API filter doesn't always enforce srType correctly
+    const filteredRecords = Array.isArray(response) 
+      ? response.filter(record => record.srType === 1)
+      : [];
+      
+    return filteredRecords.length;
+  } catch (error) {
+    console.error(`Error getting count for filters: ${fullFilters}`, error.message);
+    return 0;
   }
-
-  return records;
 }
 
 /* =========================
@@ -126,20 +161,33 @@ app.get('/api/health', (req, res) => {
 ========================= */
 app.get('/api/analytics/overview', async (req, res) => {
   try {
-    const { limit = 100, status = 'open' } = req.query;
+    const { status = 'open' } = req.query;
+    console.log(`📊 Fetching analytics with status filter: ${status}`);
 
-    // Fetch all required data in parallel
-    const [serviceRecords, agents, endUsers] = await Promise.all([
-      callConnect(`/service-records/search?limit=${limit}`),
+    // Calculate current month date range
+    const now = new Date();
+    const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999).getTime();
+    
+    console.log(`📅 Current month range: ${new Date(firstDayOfMonth).toISOString()} to ${new Date(lastDayOfMonth).toISOString()}`);
+
+    const baseFilters = buildBaseFilters(status);
+    console.log(`🔍 Base filters: ${baseFilters}`);
+
+    // Fetch all data in parallel
+    const [agents, endUsers, openRecords, closedRecords] = await Promise.all([
       callConnect('/agents?limit=100'),
-      callConnect('/end-users?limit=500') // Get more end users to properly count
+      callConnect('/end-users?limit=100'),
+      callConnect(`/service-records/search?limit=100&${buildBaseFilters('open')}&fields=srType,assignee,requestUser,priority,insertTime`),
+      status === 'closed' || status === 'all' 
+        ? callConnect(`/service-records/search?limit=100&${buildBaseFilters('closed')}&fields=srType,assignee,requestUser,priority,insertTime`)
+        : Promise.resolve([])
     ]);
-
-    const allRecords = Array.isArray(serviceRecords) ? serviceRecords : [];
-    const records = filterTicketsByStatus(allRecords, status);
 
     const agentsList = agents.data || [];
     const endUsersList = endUsers.data || [];
+
+    console.log(`👥 Loaded ${agentsList.length} agents and ${endUsersList.length} end users`);
 
     // Create lookup maps
     const agentMap = {};
@@ -152,22 +200,69 @@ app.get('/api/analytics/overview', async (req, res) => {
       endUserMap[user.id] = `${user.firstName} ${user.lastName}`.trim();
     });
 
-    // Process data for analytics
+    // Filter out non-Service Request records (srType !== 1)
+    const openServiceRequests = (Array.isArray(openRecords) ? openRecords : [])
+      .filter(record => record.srType === 1);
+    
+    const closedServiceRequests = (Array.isArray(closedRecords) ? closedRecords : [])
+      .filter(record => record.srType === 1);
+
+    console.log(`📊 Total filtered records - Open: ${openServiceRequests.length}, Closed: ${closedServiceRequests.length}`);
+
+    // Determine which records to analyze for assigneeDistribution and priorityDistribution (based on status filter)
+    let recordsForStatusBasedAnalytics = [];
+    if (status === 'open') {
+      recordsForStatusBasedAnalytics = openServiceRequests;
+    } else if (status === 'closed') {
+      recordsForStatusBasedAnalytics = closedServiceRequests;
+    } else {
+      recordsForStatusBasedAnalytics = [...openServiceRequests, ...closedServiceRequests];
+    }
+
+    // Filter for current month records (all statuses combined) for topAdministrators and topEndUsers
+    const allRecordsThisMonth = [...openServiceRequests, ...closedServiceRequests]
+      // .filter(record => 
+      //   record.insertTime >= firstDayOfMonth && record.insertTime <= lastDayOfMonth
+      // );
+
+    console.log(`📊 Current month records (all statuses): ${allRecordsThisMonth.length}`);
+
+    // Process analytics
+    const assigneeDistribution = processAssigneeDistribution(recordsForStatusBasedAnalytics, agentMap);
+    const priorityDistribution = processPriorityDistribution(recordsForStatusBasedAnalytics);
+    
+    // Top administrators and top end users based on current month data (all statuses)
+    const topAdministrators = processTopAdministrators(allRecordsThisMonth, agentMap);
+    const topEndUsers = processTopEndUsers(allRecordsThisMonth, endUserMap);
+
     const analytics = {
-      assigneeDistribution: processAssigneeDistribution(records, agentMap),
-      priorityDistribution: processPriorityDistribution(records),
-      topAdministrators: processTopAdministrators(records, agentMap),
-      topEndUsers: processTopEndUsers(records, endUserMap),
+      assigneeDistribution,
+      priorityDistribution,
+      topAdministrators,
+      topEndUsers,
       summary: {
-        total: records.length,
-        open: allRecords.filter(r => r.status !== 34).length,
-        closed: allRecords.filter(r => r.status === 34).length
+        total: status === 'all' 
+          ? openServiceRequests.length + closedServiceRequests.length 
+          : status === 'open' 
+            ? openServiceRequests.length 
+            : closedServiceRequests.length,
+        open: openServiceRequests.length,
+        closed: closedServiceRequests.length
       }
     };
 
+    console.log(`📊 Analytics Summary:`, {
+      totalOpen: openServiceRequests.length,
+      totalClosed: closedServiceRequests.length,
+      currentMonthRecords: allRecordsThisMonth.length,
+      assignees: assigneeDistribution.length,
+      topAdmins: topAdministrators.length,
+      topUsers: topEndUsers.length
+    });
+
     res.json({ success: true, data: analytics });
   } catch (e) {
-    console.error('Analytics error:', e);
+    console.error('❌ Analytics error:', e);
     res.status(500).json({
       success: false,
       error: e.message,
@@ -177,94 +272,150 @@ app.get('/api/analytics/overview', async (req, res) => {
 });
 
 /* =========================
-   Helper Functions
+   Helper Functions for In-Memory Processing
 ========================= */
 
 function processAssigneeDistribution(records, agentMap) {
-  const distribution = {};
-
+  console.log(`🔍 Processing assignee distribution from ${records.length} records...`);
+  
+  // Count tickets by assignee
+  const assigneeCounts = {};
+  
   records.forEach(record => {
-    const assigneeId = record.assignee;
-    let assigneeName = 'Unassigned';
+    const assigneeId = record.assignee || 0;
+    assigneeCounts[assigneeId] = (assigneeCounts[assigneeId] || 0) + 1;
+  });
 
-    if (assigneeId && agentMap[assigneeId]) {
-      assigneeName = agentMap[assigneeId];
+  // Convert to array format
+  const distribution = [];
+  
+  Object.keys(assigneeCounts).forEach(assigneeId => {
+    const count = assigneeCounts[assigneeId];
+    const id = parseInt(assigneeId);
+    
+    if (id === 0) {
+      // Unassigned tickets
+      distribution.push({
+        name: 'Unassigned',
+        value: count
+      });
+    } else {
+      // Assigned tickets
+      const name = agentMap[id] || `Agent ${id}`;
+      distribution.push({
+        id,
+        name,
+        value: count
+      });
     }
-
-    distribution[assigneeName] = (distribution[assigneeName] || 0) + 1;
   });
 
-  // Convert to array format for charts, sorted by count
-  return Object.entries(distribution)
-    .map(([name, count]) => ({
-      name,
-      value: count
-    }))
-    .sort((a, b) => b.value - a.value);
-}
+  // Sort by count descending
+  distribution.sort((a, b) => b.value - a.value);
 
-function processPriorityDistribution(records) {
-  const priorityMap = {
-    1: 'Very High',
-    2: 'High',
-    3: 'Normal',
-    4: 'Low',
-    5: 'Very Low'
-  };
-
-  const distribution = {};
-
-  records.forEach(record => {
-    const priority = priorityMap[record.priority] || 'Unknown';
-    distribution[priority] = (distribution[priority] || 0) + 1;
-  });
-
-  // Return in priority order
-  return Object.entries(distribution)
-    .map(([name, count]) => ({
-      name,
-      value: count
-    }))
-    .sort((a, b) => {
-      const order = { 'Very High': 1, 'High': 2, 'Normal': 3, 'Low': 4, 'Very Low': 5 };
-      return (order[a.name] || 999) - (order[b.name] || 999);
-    });
+  console.log(`📊 Assignee Distribution (${distribution.length} assignees):`, 
+    distribution.map(d => `${d.name}: ${d.value}`).join(', '));
+  
+  return distribution;
 }
 
 function processTopAdministrators(records, agentMap) {
+  console.log(`🔍 Processing top administrators from ${records.length} records (current month)...`);
+  
+  // Count tickets by assignee (excluding unassigned)
   const adminCounts = {};
-
-  // Count tickets per administrator (assignee)
+  
   records.forEach(record => {
-    if (record.assignee && agentMap[record.assignee]) {
-      const adminName = agentMap[record.assignee];
-      adminCounts[adminName] = (adminCounts[adminName] || 0) + 1;
+    const assigneeId = record.assignee;
+    if (assigneeId && assigneeId !== 0) {
+      adminCounts[assigneeId] = (adminCounts[assigneeId] || 0) + 1;
     }
   });
 
-  // Sort and get top 4
-  return Object.entries(adminCounts)
-    .map(([name, count]) => ({ name, count }))
+  // Convert to array format and get top 4
+  const topAdmins = Object.keys(adminCounts)
+    .map(adminId => {
+      const id = parseInt(adminId);
+      return {
+        id,
+        name: agentMap[id] || `Agent ${id}`,
+        count: adminCounts[adminId]
+      };
+    })
     .sort((a, b) => b.count - a.count)
     .slice(0, 4);
+
+  console.log(`📊 Top 4 Administrators:`, 
+    topAdmins.map(a => `${a.name}: ${a.count}`).join(', '));
+  
+  return topAdmins;
+}
+
+function processPriorityDistribution(records) {
+  console.log(`🔍 Processing priority distribution from ${records.length} records...`);
+  
+  const priorityMap = {
+    1: 'Highest',
+    2: 'Very High',
+    3: 'High',
+    4: 'Normal',
+    5: 'Low'
+  };
+
+  // Count tickets by priority
+  const priorityCounts = {};
+  
+  records.forEach(record => {
+    const priority = record.priority || 4; // Default to Normal if not set
+    priorityCounts[priority] = (priorityCounts[priority] || 0) + 1;
+  });
+
+  // Convert to array format and sort by priority order
+  const distribution = Object.keys(priorityCounts)
+    .map(priorityId => ({
+      name: priorityMap[priorityId] || `Priority ${priorityId}`,
+      value: priorityCounts[priorityId],
+      order: parseInt(priorityId)
+    }))
+    .sort((a, b) => a.order - b.order)
+    .map(({ name, value }) => ({ name, value }));
+
+  console.log(`📊 Priority Distribution:`, 
+    distribution.map(d => `${d.name}: ${d.value}`).join(', '));
+  
+  return distribution;
 }
 
 function processTopEndUsers(records, endUserMap) {
+  console.log(`🔍 Processing top end users from ${records.length} records (current month)...`);
+  
+  // Count tickets by request user
   const userCounts = {};
-
-  // Count tickets per end user (requestUser)
+  
   records.forEach(record => {
-    if (record.requestUser && endUserMap[record.requestUser]) {
-      const userName = endUserMap[record.requestUser];
-      userCounts[userName] = (userCounts[userName] || 0) + 1;
+    const userId = record.requestUser;
+    if (userId) {
+      userCounts[userId] = (userCounts[userId] || 0) + 1;
     }
   });
 
-  // Sort and get top 5
-  return Object.entries(userCounts)
-    .map(([name, count]) => ({ name, count }))
+  // Convert to array format and get top 5
+  const topUsers = Object.keys(userCounts)
+    .map(userId => {
+      const id = parseInt(userId);
+      return {
+        id,
+        name: endUserMap[id] || `User ${id}`,
+        count: userCounts[userId]
+      };
+    })
     .sort((a, b) => b.count - a.count)
     .slice(0, 5);
+
+  console.log(`📊 Top 5 End Users:`, 
+    topUsers.map(u => `${u.name}: ${u.count}`).join(', '));
+  
+  return topUsers;
 }
 
 /* =========================
@@ -322,16 +473,21 @@ app.get('/api/metrics/weekly', async (req, res) => {
     const sevenDaysAgo = now - 7 * day;
     const fourteenDaysAgo = now - 14 * day;
 
-    const response = await callConnect(`/service-records/search?limit=100`);
-    const allRecords = Array.isArray(response) ? response : [];
-    const { status = 'open' } = req.query;
-    const records = filterTicketsByStatus(allRecords, status);
+    const baseFilters = buildBaseFilters('open');
+    const response = await callConnect(
+      `/service-records/search?limit=100&${baseFilters}&fields=srType,updateTime,insertTime`
+    );
 
-    const currentWeek = records.filter(r =>
+    const records = Array.isArray(response) ? response : [];
+    
+    // Filter out non-Service Request records
+    const serviceRequests = records.filter(record => record.srType === 1);
+
+    const currentWeek = serviceRequests.filter(r =>
       r.updateTime >= sevenDaysAgo
     );
 
-    const previousWeek = records.filter(
+    const previousWeek = serviceRequests.filter(
       r =>
         r.updateTime >= fourteenDaysAgo &&
         r.updateTime < sevenDaysAgo
@@ -401,38 +557,41 @@ app.get('/api/metrics/weekly', async (req, res) => {
 ========================= */
 app.get('/api/tickets/active', async (req, res) => {
   try {
+    const baseFilters = buildBaseFilters('open');
     const response = await callConnect(
-      `/service-records/search?limit=100`
+      `/service-records/search?limit=100&${baseFilters}&fields=srType,dueDate,insertTime`
     );
 
     const records = Array.isArray(response) ? response : [];
-    const activeRecords = records.filter(r => r.status !== 34);
+    
+    // Filter out non-Service Request records
+    const serviceRequests = records.filter(record => record.srType === 1);
 
     const now = Date.now();
     const fiveDaysAgo = now - (5 * 24 * 60 * 60 * 1000);
 
-    const overdue = activeRecords.filter(r =>
+    const overdue = serviceRequests.filter(r =>
       r.dueDate && new Date(r.dueDate).getTime() < now
     ).length;
 
-    const openMoreThan5Days = activeRecords.filter(r =>
+    const openMoreThan5Days = serviceRequests.filter(r =>
       r.insertTime && r.insertTime < fiveDaysAgo
     ).length;
 
-    const noDueDate = activeRecords.filter(r => !r.dueDate).length;
+    const noDueDate = serviceRequests.filter(r => !r.dueDate).length;
 
     res.json({
       success: true,
       data: {
-        totalActive: activeRecords.length,
-        overduePercent: activeRecords.length > 0
-          ? (overdue / activeRecords.length) * 100
+        totalActive: serviceRequests.length,
+        overduePercent: serviceRequests.length > 0
+          ? (overdue / serviceRequests.length) * 100
           : 0,
-        openMoreThan5Days: activeRecords.length > 0
-          ? (openMoreThan5Days / activeRecords.length) * 100
+        openMoreThan5Days: serviceRequests.length > 0
+          ? (openMoreThan5Days / serviceRequests.length) * 100
           : 0,
-        noDueDate: activeRecords.length > 0
-          ? (noDueDate / activeRecords.length) * 100
+        noDueDate: serviceRequests.length > 0
+          ? (noDueDate / serviceRequests.length) * 100
           : 0
       }
     });
@@ -464,5 +623,13 @@ app.get('/api/connect/*', async (req, res) => {
 ========================= */
 app.listen(PORT, () => {
   console.log(`🚀 SysAid Analytics Backend running on ${PORT}`);
-  console.log(`📊 Fetching real data from agents and end-users endpoints`);
+  console.log(`📊 Analytics Processing Method: In-Memory Grouping (Current Month)`);
+  console.log(`   📋 SR Type: 1 (Service Requests only)`);
+  console.log(`   📅 Time Filter: Current month (insertTime) for Top Admins & Top Users`);
+  console.log(`   🔓 OPEN statuses: ${OPEN_STATUS_IDS.join(', ')}`);
+  console.log(`   🔒 CLOSED statuses: ${CLOSED_STATUS_IDS.join(', ')}`);
+  console.log(`💡 Top End Users: Based on requestUser with most tickets this month (all statuses)`);
+  console.log(`💡 Top Admins: Based on assignee with most tickets this month (all statuses)`);
+  console.log(`💡 Service Overview: Grouped by priority (Highest, Very High, High, Normal, Low)`);
+  console.log(`⚠️  Client-side filtering for srType=1 to exclude non-Service Requests`);
 });
